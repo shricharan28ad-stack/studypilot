@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: studypilot
+    runtime: docker
+    plan: starter
+    healthCheckPath: /api/health
+    disk:
+      name: studypilot-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: AI_API_KEY
+        sync: false
+      - key: AI_MODEL
+        value: gpt-4.1-mini
+      - key: AI_BASE_URL
+        value: https://api.openai.com/v1
+      - key: REQUIRE_AI
+        value: 'true'
+      - key: COOKIE_SECURE
+        value: 'true'
+      - key: ALLOW_REGISTRATION
+        value: 'true'
+      - key: AI_USER_DAILY_LIMIT
+        value: '10'
+      - key: AI_GLOBAL_DAILY_LIMIT
+        value: '100'

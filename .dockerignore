@@ -1,0 +1,13 @@
+.git
+.openai
+.venv
+node_modules
+dist
+.env
+.env.local
+backend/.env
+backend/data
+__pycache__
+.pytest_cache
+*.pyc
+*.tsbuildinfo
