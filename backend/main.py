@@ -115,6 +115,26 @@ def demo_questions(facts, retest=False):
         questions.append({'id':f'{"r" if retest else "q"}-{i}', 'topic':fact['topic'], 'prompt':f'Complete the statement from your notes: “_____ {tail}.”' if retest else f'According to your notes, complete: “{head} _____.”', 'options':options, 'correct':options.index(answer), 'explanation':fact['text'], 'difficulty':'Foundational', 'level':'Recall', 'source_quote':fact['text']})
     return questions
 
+def provider_diagnostic(response):
+    """Return only known public error categories; never provider payloads or credentials."""
+    try:
+        error=response.json().get('error',{})
+        if not isinstance(error,dict):return 'UNKNOWN'
+        message=str(error.get('message','')).lower()
+        allowed={'API_KEY_INVALID','API_KEY_SERVICE_BLOCKED','API_KEY_HTTP_REFERRER_BLOCKED',
+          'API_KEY_IP_ADDRESS_BLOCKED','SERVICE_DISABLED','BILLING_DISABLED','CONSUMER_SUSPENDED',
+          'ACCESS_TOKEN_TYPE_UNSUPPORTED','API_KEY_EXPIRED','API_KEY_NOT_FOUND'}
+        for detail in error.get('details',[]):
+            if isinstance(detail,dict) and detail.get('reason') in allowed:return detail['reason']
+        for phrase,category in [('reported as leaked','KEY_REPORTED_LEAKED'),('unregistered callers','KEY_NOT_RECOGNIZED'),
+          ('your project has been denied access','PROJECT_ACCESS_DENIED'),('api keys are not supported','AUTH_METHOD_UNSUPPORTED'),
+          ('multiple authentication credentials','MULTIPLE_AUTH_CREDENTIALS'),('location is not supported','LOCATION_UNSUPPORTED'),
+          ('api key not valid','API_KEY_INVALID'),('has not been used in project','SERVICE_DISABLED'),
+          ('requests from referer','API_KEY_HTTP_REFERRER_BLOCKED'),('insufficient authentication scopes','AUTH_SCOPE_INSUFFICIENT')]:
+            if phrase in message:return category
+    except (ValueError,TypeError,AttributeError):pass
+    return 'UNKNOWN'
+
 async def generate(text, retest=False, previous=None, topics=None):
     if not AI_KEY:
         if os.getenv('REQUIRE_AI','true').lower()=='true':raise HTTPException(503,'AI_API_KEY must be configured on the server.')
@@ -140,7 +160,11 @@ async def generate(text, retest=False, previous=None, topics=None):
                 response.raise_for_status()
             except httpx.HTTPStatusError as exc:
                 status=exc.response.status_code
-                logging.getLogger('studypilot.ai').warning('AI provider HTTP status=%s',status)
+                reason=provider_diagnostic(exc.response)
+                from urllib.parse import urlsplit
+                provider=urlsplit(AI_URL).hostname or 'unset'
+                model=AI_MODEL if re.fullmatch(r'[a-zA-Z0-9._/-]{1,120}',AI_MODEL) else 'invalid-format'
+                logging.getLogger('studypilot.ai').warning('AI provider HTTP status=%s reason=%s host=%s model=%s',status,reason,provider,model)
                 messages={
                     400:'The AI provider rejected the request. Check AI_MODEL, AI_BASE_URL and whether the API key belongs to this provider in Render.',
                     401:'The AI provider rejected the API key. Update AI_API_KEY in Render and redeploy.',
@@ -148,7 +172,18 @@ async def generate(text, retest=False, previous=None, topics=None):
                     404:'The configured AI model or endpoint was not found. Check AI_MODEL and AI_BASE_URL in Render; use a model available to your API project.',
                     429:'Your AI provider quota or rate limit has been reached. Check your Google AI Studio quota and retry after it resets. Repeated clicks will not resolve an exhausted quota.'
                 }
-                raise HTTPException(502,messages.get(status,'The AI provider is temporarily unavailable. Try again later.')) from None
+                specific={
+                    'KEY_REPORTED_LEAKED':'Google has blocked this API key because it was reported as leaked. Replace AI_API_KEY with a new private key in Render and redeploy.',
+                    'PROJECT_ACCESS_DENIED':'Google has denied this project access to Gemini. Check the project in Google AI Studio or contact Google support; replacing a key in the same blocked project will not resolve this.',
+                    'API_KEY_SERVICE_BLOCKED':'The API key does not permit this API. Check that its API restrictions allow the Generative Language API.',
+                    'API_KEY_HTTP_REFERRER_BLOCKED':'The key has website/referrer restrictions that reject server requests. Use a key configured for this backend.',
+                    'API_KEY_IP_ADDRESS_BLOCKED':'The API key IP restrictions do not permit this Render server. Check the allowed outbound IP addresses.',
+                    'SERVICE_DISABLED':'The Generative Language API is disabled for the key’s Google Cloud project. Enable it for that project.',
+                    'API_KEY_INVALID':'Google does not recognize the configured API key. Check AI_API_KEY in Render and redeploy.',
+                    'LOCATION_UNSUPPORTED':'Google does not support Gemini requests from the current server location.'
+                }
+                detail=specific.get(reason,messages.get(status,'The AI provider is temporarily unavailable. Try again later.'))
+                raise HTTPException(502,detail+' [Provider code: '+reason+']') from None
             except httpx.TimeoutException:
                 raise HTTPException(504,'The AI provider timed out. Try a smaller section of notes or retry later.') from None
             except httpx.RequestError:

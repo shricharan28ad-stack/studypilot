@@ -74,3 +74,13 @@ def test_gemini_schema_and_pdf_line_breaks(monkeypatch,finish_reason,valid):
         assert len(result[1])==len(output['questions'])
     else:
         with pytest.raises(HTTPException,match='cut short'):asyncio.run(module.generate(text))
+
+@pytest.mark.parametrize('error,expected',[
+ ({'message':'Your API key was reported as leaked. secret'},'KEY_REPORTED_LEAKED'),
+ ({'message':'Your project has been denied access. secret'},'PROJECT_ACCESS_DENIED'),
+ ({'details':[{'reason':'API_KEY_SERVICE_BLOCKED','metadata':{'key':'secret'}}]},'API_KEY_SERVICE_BLOCKED'),
+ ({'message':'secret','details':[{'reason':'secret'}]},'UNKNOWN'),
+ ('secret','UNKNOWN')])
+def test_safe_provider_diagnostic(error,expected):
+    from backend.main import provider_diagnostic
+    assert provider_diagnostic(httpx.Response(403,json={'error':error}))==expected
