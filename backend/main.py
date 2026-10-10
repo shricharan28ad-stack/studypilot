@@ -1,5 +1,6 @@
 """StudyPilot multi-user API. Run from project root: uvicorn backend.main:app."""
 import json
+import logging
 import os
 import re
 import secrets
@@ -131,19 +132,54 @@ async def generate(text, retest=False, previous=None, topics=None):
               'Each question must include an exact source_quote from these notes supporting the correct answer. '
               'Use topic headings from the notes. Explain the answer. No external facts. '
               + (f'Retest: use genuinely different questions from {json.dumps(previous or [])}. Focus on topics {json.dumps(topics or [])}. ' if retest else ''))
+            response_format = {'type':'json_object'}
+            if 'generativelanguage.googleapis.com' in AI_URL:
+                response_format = {'type':'json_schema','json_schema':{'name':'study_kit','schema':schema}}
             try:
-                response = await client.post(AI_URL+'/chat/completions', headers={'Authorization':'Bearer '+AI_KEY}, json={'model':AI_MODEL, 'messages':[{'role':'system','content':instructions+' Schema: '+json.dumps(schema)},{'role':'user','content':chunk}], 'response_format':{'type':'json_object'},'temperature':0.3,'max_tokens':6000})
+                response = await client.post(AI_URL+'/chat/completions', headers={'Authorization':'Bearer '+AI_KEY}, json={'model':AI_MODEL, 'messages':[{'role':'system','content':instructions+' Schema: '+json.dumps(schema)},{'role':'user','content':chunk}], 'response_format':response_format,'temperature':0.3,'max_tokens':6000})
                 response.raise_for_status()
-                output = Generated.model_validate_json(response.json()['choices'][0]['message']['content'])
-                for q in output.questions:
-                    if not q.source_quote.strip() or q.source_quote not in chunk:
-                        raise ValueError('Source evidence validation failed')
-                    if retest and q.prompt in (previous or []):
-                        raise ValueError('Retest reused a question')
-                facts.extend(f.model_dump() for f in output.facts)
-                questions.extend(q.model_dump() for q in output.questions)
-            except (httpx.HTTPError, ValueError, KeyError, IndexError):
-                raise HTTPException(502, 'The AI service returned an unavailable or invalid response. Please retry; no kit was saved.')
+            except httpx.HTTPStatusError as exc:
+                status=exc.response.status_code
+                logging.getLogger('studypilot.ai').warning('AI provider HTTP status=%s',status)
+                messages={
+                    400:'The AI provider rejected the request. Check AI_MODEL, AI_BASE_URL and whether the API key belongs to this provider in Render.',
+                    401:'The AI provider rejected the API key. Update AI_API_KEY in Render and redeploy.',
+                    403:'The AI provider denied access. Check the API key restrictions and your project permissions or regional availability.',
+                    404:'The configured AI model or endpoint was not found. Check AI_MODEL and AI_BASE_URL in Render; use a model available to your API project.',
+                    429:'Your AI provider quota or rate limit has been reached. Check your Google AI Studio quota and retry after it resets. Repeated clicks will not resolve an exhausted quota.'
+                }
+                raise HTTPException(502,messages.get(status,'The AI provider is temporarily unavailable. Try again later.')) from None
+            except httpx.TimeoutException:
+                raise HTTPException(504,'The AI provider timed out. Try a smaller section of notes or retry later.') from None
+            except httpx.RequestError:
+                raise HTTPException(502,'Unable to connect to the AI provider. Check AI_BASE_URL in Render or retry later.') from None
+            try:
+                choice=response.json()['choices'][0]
+                if choice.get('finish_reason')=='length':
+                    raise HTTPException(502,'The AI response was cut short by its output limit. Try a smaller section of notes.')
+                if choice.get('finish_reason') in {'content_filter','safety'} or choice.get('message',{}).get('refusal'):
+                    raise HTTPException(422,'The AI provider declined to process these notes. Try another section.')
+                content=choice['message']['content']
+                if not isinstance(content,str) or not content.strip():
+                    raise ValueError('empty_response')
+                content=content.strip()
+                if content.startswith('```'):
+                    content=re.sub(r'^```(?:json)?\s*|\s*```$', '', content, flags=re.IGNORECASE)
+                output = Generated.model_validate_json(content)
+            except (ValueError, KeyError, IndexError, TypeError):
+                logging.getLogger('studypilot.ai').warning('AI response failed JSON/schema validation')
+                raise HTTPException(502,'The AI returned an incomplete or incorrectly formatted study kit. Try again with a smaller section of explanatory notes.') from None
+            normalized_chunk=' '.join(chunk.split())
+            for q in output.questions:
+                # PDF extraction inserts line breaks inside otherwise exact quotations.
+                quote=' '.join(q.source_quote.split())
+                if not quote or quote not in normalized_chunk:
+                    logging.getLogger('studypilot.ai').warning('AI source evidence validation failed')
+                    raise HTTPException(502,'The AI returned a question whose source evidence could not be verified in your notes. No kit was saved. Please retry.')
+                if retest and q.prompt in (previous or []):
+                    raise HTTPException(502,'The AI repeated a previous question. Please retry the retest.')
+            facts.extend(f.model_dump() for f in output.facts)
+            questions.extend(q.model_dump() for q in output.questions)
     unique_facts = list({(f['topic'],f['text']):f for f in facts}.values())[:80]
     # Spread selection across chunks instead of taking only the first chunk.
     selected = questions[::max(1,len(questions)//20)][:30]
