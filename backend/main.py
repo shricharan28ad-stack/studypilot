@@ -20,6 +20,7 @@ from fastapi import Depends, FastAPI, File, HTTPException, UploadFile, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from .storage import db
+from .revision import revision_plan
 from .auth import router, current_user, read_preferences, reserve_generation
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -88,6 +89,7 @@ class GenerateInput(BaseModel): document_id: str
 class RevisionInput(BaseModel):
     kit_id: str
     topics: list[str] = Field(default_factory=list, max_length=80)
+    smart: bool = False
 class Submission(BaseModel):
     answers: list[int] = Field(min_length=1, max_length=30)
     question_ids: list[str] = Field(min_length=1, max_length=30)
@@ -158,14 +160,14 @@ def generation_slot(user):
     try:yield
     finally:active_generations.discard(user['id'])
 
-async def bounded_generate(*args):
+async def bounded_generate(*args,**kwargs):
     try:
         async with asyncio.timeout(240):
-            return await generate(*args)
+            return await generate(*args,**kwargs)
     except TimeoutError:
         raise HTTPException(504,'Generation took too long. Your notes are retained. Try a smaller section.') from None
 
-async def generate(text, retest=False, previous=None, topics=None, _evidence_retry=False, _retry_reason=''):
+async def generate(text, retest=False, previous=None, topics=None, _evidence_retry=False, _retry_reason='', difficulty_targets=None):
     if not text.strip():raise HTTPException(422,'No explanatory notes are available for these topics.')
     if not AI_KEY:
         if os.getenv('REQUIRE_AI','true').lower()=='true':raise HTTPException(503,'AI_API_KEY must be configured on the server.')
@@ -187,6 +189,8 @@ async def generate(text, retest=False, previous=None, topics=None, _evidence_ret
                 instructions += 'A previous attempt failed evidence validation. Use short verbatim quotations. Only ask questions you can support with an exact contiguous quote. '
             if _retry_reason:
                 instructions += 'The previous response was invalid ('+_retry_reason+'). Return a complete JSON object with facts and questions, all required fields, and only 4 short questions. '
+            if difficulty_targets:
+                instructions += 'Use ONLY these exact topic names and target difficulties: '+json.dumps(difficulty_targets)+'. Foundational means direct recall with simple options; Intermediate means explanation or comparison; Advanced means a source-supported application scenario. Match the question reasoning to the target, not just its label. Include at least one question for each target topic. '
             native_gemini=urlsplit(AI_URL).hostname=='generativelanguage.googleapis.com'
             try:
                 if native_gemini:
@@ -215,7 +219,7 @@ async def generate(text, retest=False, previous=None, topics=None, _evidence_ret
                 status=exc.response.status_code
                 if status in {500,502,503,504} and not _evidence_retry:
                     await asyncio.sleep(1)
-                    recovered_facts,recovered_questions,_=await generate(chunk,retest,previous,topics,True,'temporary provider failure')
+                    recovered_facts,recovered_questions,_=await generate(chunk,retest,previous,topics,True,'temporary provider failure',difficulty_targets=difficulty_targets)
                     facts.extend(recovered_facts);questions.extend(recovered_questions)
                     continue
                 reason=provider_diagnostic(exc.response)
@@ -243,13 +247,13 @@ async def generate(text, retest=False, previous=None, topics=None, _evidence_ret
                 raise HTTPException(502,detail+' [Provider code: '+reason+']') from None
             except httpx.TimeoutException:
                 if not _evidence_retry:
-                    recovered_facts,recovered_questions,_=await generate(chunk,retest,previous,topics,True,'timeout; keep output brief')
+                    recovered_facts,recovered_questions,_=await generate(chunk,retest,previous,topics,True,'timeout; keep output brief',difficulty_targets=difficulty_targets)
                     facts.extend(recovered_facts);questions.extend(recovered_questions)
                     continue
                 raise HTTPException(504,'The AI provider timed out. Try a smaller section of notes or retry later.') from None
             except httpx.RequestError:
                 if not _evidence_retry:
-                    recovered_facts,recovered_questions,_=await generate(chunk,retest,previous,topics,True,'connection interrupted')
+                    recovered_facts,recovered_questions,_=await generate(chunk,retest,previous,topics,True,'connection interrupted',difficulty_targets=difficulty_targets)
                     facts.extend(recovered_facts);questions.extend(recovered_questions)
                     continue
                 raise HTTPException(502,'Unable to connect to the AI provider. Check AI_BASE_URL in Render or retry later.') from None
@@ -278,6 +282,11 @@ async def generate(text, retest=False, previous=None, topics=None, _evidence_ret
                 if content.startswith('```'):
                     content=re.sub(r'^```(?:json)?\s*|\s*```$', '', content, flags=re.IGNORECASE)
                 output = Generated.model_validate_json(content)
+                if difficulty_targets:
+                    if any(q.topic not in difficulty_targets or q.difficulty!=difficulty_targets[q.topic] for q in output.questions):
+                        raise ValueError('adaptive difficulty mismatch')
+                    if set(difficulty_targets)-{q.topic for q in output.questions}:
+                        raise ValueError('missing target topic')
             except (ValueError, KeyError, IndexError, TypeError, AttributeError) as exc:
                 # Log schema categories only, never model output, user notes, or credentials.
                 reason='invalid JSON or response structure'
@@ -286,9 +295,10 @@ async def generate(text, retest=False, previous=None, topics=None, _evidence_ret
                     fields=sorted({str(part) for e in exc.errors() for part in e['loc'] if part in known})
                     reason='invalid fields: '+', '.join(fields)
                 elif str(exc)=='output_limit':reason='output limit'
+                elif str(exc) in {'adaptive difficulty mismatch','missing target topic'}:reason=str(exc)
                 logging.getLogger('studypilot.ai').warning('AI response validation failed: %s; retry_available=%s',reason,not _evidence_retry)
                 if not _evidence_retry:
-                    recovered_facts,recovered_questions,_=await generate(chunk,retest,previous,topics,True,reason)
+                    recovered_facts,recovered_questions,_=await generate(chunk,retest,previous,topics,True,reason,difficulty_targets=difficulty_targets)
                     facts.extend(recovered_facts);questions.extend(recovered_questions)
                     continue
                 raise HTTPException(502,'The AI could not return a complete valid study kit after one automatic retry. Your notes are retained; try a shorter section.') from None
@@ -299,13 +309,13 @@ async def generate(text, retest=False, previous=None, topics=None, _evidence_ret
                 logging.getLogger('studypilot.ai').warning('AI source evidence validation failed; retry_available=%s',not _evidence_retry)
                 if _evidence_retry:
                     raise HTTPException(502,'The AI could not produce verifiable source quotes after one automatic retry. No kit was saved. Try a smaller section of explanatory notes.')
-                recovered_facts,recovered_questions,_=await generate(chunk,retest,previous,topics,_evidence_retry=True)
+                recovered_facts,recovered_questions,_=await generate(chunk,retest,previous,topics,_evidence_retry=True,difficulty_targets=difficulty_targets)
                 facts.extend(recovered_facts)
                 questions.extend(recovered_questions)
                 continue
             if retest and any(q.prompt in (previous or []) for q in output.questions):
                 if _evidence_retry:raise HTTPException(502,'The AI repeated a previous question after one retry. Try different topics.')
-                recovered_facts,recovered_questions,_=await generate(chunk,retest,previous,topics,True,'repeated quiz question')
+                recovered_facts,recovered_questions,_=await generate(chunk,retest,previous,topics,True,'repeated quiz question',difficulty_targets=difficulty_targets)
                 facts.extend(recovered_facts);questions.extend(recovered_questions)
                 continue
             facts.extend(f.model_dump() for f in output.facts)
@@ -413,6 +423,10 @@ def get_kit(id:str,user=Depends(current_user)): return kit_by_id(id,user)
 def submit(id:str,body:Submission,user=Depends(current_user)):
     with db() as conn: row=conn.execute('SELECT q.* FROM quizzes q JOIN kits k ON k.id=q.kit_id JOIN documents d ON d.id=k.document_id WHERE q.id=? AND d.user_id=?',(id,user['id'])).fetchone()
     if not row: raise HTTPException(404,'Quiz not found')
+    with db() as conn:
+        for saved in conn.execute('SELECT payload FROM attempts WHERE kit_id=?',(row['kit_id'],)):
+            previous_attempt=json.loads(saved['payload'])
+            if previous_attempt.get('quizId')==id:return previous_attempt
     qs={q['id']:q for q in json.loads(row['payload'])}
     if len(body.answers)!=len(body.question_ids) or len(set(body.question_ids))!=len(body.question_ids) or any(i not in qs for i in body.question_ids):
         raise HTTPException(422,'Invalid question set')
@@ -421,7 +435,7 @@ def submit(id:str,body:Submission,user=Depends(current_user)):
         q=qs[id]
         if not 0<=answer<len(q['options']): raise HTTPException(422,'Invalid answer option')
         results.append({'topic':q['topic'],'correct':answer==q['correct'],'difficulty':q['difficulty'],'level':q['level']})
-    attempt={'id':new_id(),'kitId':row['kit_id'],'date':now(),'score':round(sum(r['correct'] for r in results)/len(results)*100),'results':results,'retest':bool(row['retest'])}
+    attempt={'id':new_id(),'quizId':row['id'],'kitId':row['kit_id'],'date':now(),'score':round(sum(r['correct'] for r in results)/len(results)*100),'results':results,'retest':bool(row['retest'])}
     with db() as conn: conn.execute('INSERT INTO attempts VALUES (?,?,?)',(attempt['id'],row['kit_id'],json.dumps(attempt)))
     return attempt
 
@@ -429,6 +443,11 @@ def submit(id:str,body:Submission,user=Depends(current_user)):
 def performance(user=Depends(current_user)): return {'attempts':attempts(user),'topics':scores(attempts(user))}
 @app.get('/api/performance/topics')
 def topic_performance(user=Depends(current_user)): return scores(attempts(user))
+
+@app.get('/api/revision/plan/{id}')
+def smart_plan(id:str,user=Depends(current_user)):
+    kit=kit_by_id(id,user)
+    return revision_plan(kit,attempts(user))
 
 @app.post('/api/revision/generate')
 def revision(body:RevisionInput,user=Depends(current_user)):
@@ -442,10 +461,17 @@ def revision(body:RevisionInput,user=Depends(current_user)):
 async def retest(body:RevisionInput,user=Depends(current_user)):
     kit=kit_by_id(body.kit_id,user)
     with generation_slot(user):
+        targets=None
+        if body.smart:
+            plan=revision_plan(kit,attempts(user))
+            candidates=[t for t in plan['topics'] if not body.topics or t['topic'] in body.topics]
+            if not candidates:raise HTTPException(422,'Choose a topic from this study kit.')
+            targets={t['topic']:t['difficulty'] for t in candidates[:3]}
+            body.topics=list(targets)
         reserve_generation(user)
         if AI_KEY:
             text='\n'.join(f['topic']+'\n'+f['text'] for f in kit['facts'] if not body.topics or f['topic'] in body.topics)
-            _,questions,_=await bounded_generate(text,True,[q['prompt'] for q in kit['questions']],body.topics)
+            _,questions,_=await bounded_generate(text,True,[q['prompt'] for q in kit['questions']],body.topics,difficulty_targets=targets)
         else:
             questions=[q for q in demo_questions(kit['facts'],True) if not body.topics or q['topic'] in body.topics]
         if not questions: raise HTTPException(422,'No questions available for those topics')
