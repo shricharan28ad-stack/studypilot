@@ -165,6 +165,23 @@ async def generate(text, retest=False, previous=None, topics=None):
                 provider=urlsplit(AI_URL).hostname or 'unset'
                 model=AI_MODEL if re.fullmatch(r'[a-zA-Z0-9._/-]{1,120}',AI_MODEL) else 'invalid-format'
                 logging.getLogger('studypilot.ai').warning('AI provider HTTP status=%s reason=%s host=%s model=%s',status,reason,provider,model)
+                if status==403 and provider=='generativelanguage.googleapis.com':
+                    try:
+                        probe=await client.get('https://generativelanguage.googleapis.com/v1beta/models',headers={'x-goog-api-key':AI_KEY})
+                        data=probe.json()
+                        if probe.status_code==200:
+                            available=any(m.get('name')=='models/'+AI_MODEL for m in data.get('models',[]))
+                            logging.getLogger('studypilot.ai').warning('Gemini native probe status=200 configured_model_listed=%s',available)
+                        else:
+                            error=data.get('error',{}) if isinstance(data,dict) else {}
+                            message=str(error.get('message','')) if isinstance(error,dict) else ''
+                            # This metadata-only request contains no source notes. Redact key/opaque tokens.
+                            message=message.replace(AI_KEY,'[redacted]') if AI_KEY else message
+                            message=re.sub(r'[A-Za-z0-9_./+=-]{30,}','[redacted]',message)
+                            message=' '.join(message.split())[:500]
+                            logging.getLogger('studypilot.ai').warning('Gemini native probe status=%s message=%s',probe.status_code,message)
+                    except (httpx.HTTPError,ValueError,TypeError,AttributeError):
+                        logging.getLogger('studypilot.ai').warning('Gemini native metadata probe unavailable')
                 messages={
                     400:'The AI provider rejected the request. Check AI_MODEL, AI_BASE_URL and whether the API key belongs to this provider in Render.',
                     401:'The AI provider rejected the API key. Update AI_API_KEY in Render and redeploy.',
