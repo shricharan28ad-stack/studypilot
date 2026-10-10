@@ -130,7 +130,7 @@ def provider_diagnostic(response):
         for phrase,category in [('reported as leaked','KEY_REPORTED_LEAKED'),('unregistered callers','KEY_NOT_RECOGNIZED'),
           ('your project has been denied access','PROJECT_ACCESS_DENIED'),('api keys are not supported','AUTH_METHOD_UNSUPPORTED'),
           ('multiple authentication credentials','MULTIPLE_AUTH_CREDENTIALS'),('location is not supported','LOCATION_UNSUPPORTED'),
-          ('api key not valid','API_KEY_INVALID'),('has not been used in project','SERVICE_DISABLED'),
+          ('api key expired','API_KEY_EXPIRED'),('api key not valid','API_KEY_INVALID'),('billing','BILLING_REQUIRED'),('schema','SCHEMA_REJECTED'),('invalid json payload','INVALID_REQUEST_FORMAT'),('has not been used in project','SERVICE_DISABLED'),
           ('requests from referer','API_KEY_HTTP_REFERRER_BLOCKED'),('insufficient authentication scopes','AUTH_SCOPE_INSUFFICIENT')]:
             if phrase in message:return category
     except (ValueError,TypeError,AttributeError):pass
@@ -159,11 +159,23 @@ async def generate(text, retest=False, previous=None, topics=None):
                     model_name=AI_MODEL.removeprefix('models/')
                     response=await client.post('https://generativelanguage.googleapis.com/v1beta/models/'+urlquote(model_name,safe='')+':generateContent',
                       headers={'x-goog-api-key':AI_KEY},json={
-                        'systemInstruction':{'parts':[{'text':instructions}]},
+                        'systemInstruction':{'parts':[{'text':instructions+' Schema: '+json.dumps(schema)}]},
                         'contents':[{'role':'user','parts':[{'text':chunk}]}],
                         'generationConfig':{'responseMimeType':'application/json','responseJsonSchema':schema,'temperature':0.3,'maxOutputTokens':6000}})
                 else:
                     response = await client.post(AI_URL+'/chat/completions', headers={'Authorization':'Bearer '+AI_KEY}, json={'model':AI_MODEL, 'messages':[{'role':'system','content':instructions+' Schema: '+json.dumps(schema)},{'role':'user','content':chunk}], 'response_format':{'type':'json_object'},'temperature':0.3,'max_tokens':6000})
+                if native_gemini and response.status_code==400:
+                    try:
+                        upstream_error=response.json().get('error',{})
+                        description=str(upstream_error.get('message','')).lower() if isinstance(upstream_error,dict) else ''
+                    except (ValueError,AttributeError):description=''
+                    if 'schema' in description or 'responsejsonschema' in description:
+                        logging.getLogger('studypilot.ai').warning('Gemini rejected response schema; retrying JSON mode with server-side validation')
+                        response=await client.post('https://generativelanguage.googleapis.com/v1beta/models/'+urlquote(model_name,safe='')+':generateContent',
+                          headers={'x-goog-api-key':AI_KEY},json={
+                            'systemInstruction':{'parts':[{'text':instructions+' Schema: '+json.dumps(schema)}]},
+                            'contents':[{'role':'user','parts':[{'text':chunk}]}],
+                            'generationConfig':{'responseMimeType':'application/json','temperature':0.3,'maxOutputTokens':6000}})
                 response.raise_for_status()
             except httpx.HTTPStatusError as exc:
                 status=exc.response.status_code

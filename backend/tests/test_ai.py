@@ -86,3 +86,26 @@ def test_gemini_schema_and_pdf_line_breaks(monkeypatch,finish_reason,valid):
 def test_safe_provider_diagnostic(error,expected):
     from backend.main import provider_diagnostic
     assert provider_diagnostic(httpx.Response(403,json={'error':error}))==expected
+
+def test_gemini_schema_fallback(monkeypatch):
+    import asyncio
+    import backend.main as module
+    monkeypatch.setattr(module,'AI_KEY','test')
+    monkeypatch.setattr(module,'AI_URL','https://generativelanguage.googleapis.com/v1beta/openai')
+    facts=module.extract_facts(NOTES)
+    output={'facts':facts,'questions':module.demo_questions(facts)}
+    calls=[]
+    class Provider:
+        def __init__(self,**kwargs):pass
+        async def __aenter__(self):return self
+        async def __aexit__(self,*args):pass
+        async def post(self,url,**kwargs):
+            calls.append(kwargs['json'])
+            if len(calls)==1:
+                return httpx.Response(400,json={'error':{'message':'Unsupported responseJsonSchema field'}},request=httpx.Request('POST',url))
+            assert 'responseJsonSchema' not in kwargs['json']['generationConfig']
+            assert 'Schema:' in kwargs['json']['systemInstruction']['parts'][0]['text']
+            return httpx.Response(200,json={'candidates':[{'finishReason':'STOP','content':{'parts':[{'text':json.dumps(output)}]}}]},request=httpx.Request('POST',url))
+    monkeypatch.setattr(module.httpx,'AsyncClient',Provider)
+    assert asyncio.run(module.generate(NOTES))[2]=='AI generated'
+    assert len(calls)==2
