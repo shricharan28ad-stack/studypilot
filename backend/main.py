@@ -471,6 +471,9 @@ async def retest(body:RevisionInput,user=Depends(current_user)):
         reserve_generation(user)
         if AI_KEY:
             text='\n'.join(f['topic']+'\n'+f['text'] for f in kit['facts'] if not body.topics or f['topic'] in body.topics)
+            if body.smart:
+                passages=[q.get('source_quote','') for q in kit['questions'] if q['topic'] in body.topics]
+                text+='\n'+'\n'.join(dict.fromkeys(p for p in passages if p))
             _,questions,_=await bounded_generate(text,True,[q['prompt'] for q in kit['questions']],body.topics,difficulty_targets=targets)
         else:
             questions=[q for q in demo_questions(kit['facts'],True) if not body.topics or q['topic'] in body.topics]

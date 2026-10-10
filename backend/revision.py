@@ -6,7 +6,7 @@ INTERVALS = [1, 3, 7, 14, 30]
 
 def revision_plan(kit, history, at=None):
     at = at or datetime.now(timezone.utc)
-    topics = list(dict.fromkeys(f['topic'] for f in kit['facts']))
+    topics = list(dict.fromkeys([q['topic'] for q in kit.get('questions',[])] + [f['topic'] for f in kit['facts']] + [r['topic'] for a in history if a['kitId']==kit['id'] for r in a['results']]))
     rows = []
     for topic in topics:
         difficulty, streak, reviewed, mistakes = 0, 0, 0, 0

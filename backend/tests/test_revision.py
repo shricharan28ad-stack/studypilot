@@ -64,3 +64,10 @@ def test_adaptive_request_enforces_target_difficulty(api,monkeypatch):
     monkeypatch.setattr(module.httpx,'AsyncClient',Provider)
     result=asyncio.run(module.generate(NOTES,difficulty_targets=targets))
     assert len(calls)==2 and all(q['difficulty']=='Advanced' for q in result[1])
+
+def test_question_topics_are_never_lost_when_fact_labels_differ():
+    kit={'id':'k','facts':[{'topic':'General notes','text':'Source notes.'}],
+        'questions':[{'topic':'Keys'}]}
+    plan=revision_plan(kit,[attempt(0,False)],BASE)
+    topic=next(t for t in plan['topics'] if t['topic']=='Keys')
+    assert topic['mistakes']==1 and topic['reviews']==1
