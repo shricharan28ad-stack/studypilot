@@ -109,3 +109,27 @@ def test_gemini_schema_fallback(monkeypatch):
     monkeypatch.setattr(module.httpx,'AsyncClient',Provider)
     assert asyncio.run(module.generate(NOTES))[2]=='AI generated'
     assert len(calls)==2
+
+def test_evidence_retry_recovers_without_saving_unverified_output(api,monkeypatch):
+    import backend.main as module
+    monkeypatch.setattr(module,'AI_KEY','test')
+    facts=module.extract_facts(NOTES)
+    calls=[]
+    class Provider:
+        def __init__(self,**kwargs):pass
+        async def __aenter__(self):return self
+        async def __aexit__(self,*args):pass
+        async def post(self,url,**kwargs):
+            calls.append(kwargs['json'])
+            output={'facts':facts,'questions':module.demo_questions(facts)}
+            if len(calls)==1:
+                output['questions'][0]['source_quote']='This is not in the source.'
+            else:
+                assert 'previous attempt failed' in kwargs['json']['messages'][0]['content']
+            return httpx.Response(200,json={'choices':[{'message':{'content':json.dumps(output)}}]},request=httpx.Request('POST',url))
+    monkeypatch.setattr(module.httpx,'AsyncClient',Provider)
+    doc=api.post('/api/documents/text',json={'name':'Retry notes','text':NOTES}).json()
+    response=api.post('/api/study-kit/generate',json={'document_id':doc['id']})
+    assert response.status_code==200
+    assert len(calls)==2
+    assert all(q['source_quote'] in NOTES for q in response.json()['questions'])
