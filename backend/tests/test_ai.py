@@ -64,9 +64,11 @@ def test_gemini_schema_and_pdf_line_breaks(monkeypatch,finish_reason,valid):
         async def __aenter__(self):return self
         async def __aexit__(self,*args):pass
         async def post(self,url,**kwargs):
-            assert kwargs['json']['response_format']['type']=='json_schema'
-            assert 'properties' in kwargs['json']['response_format']['json_schema']['schema']
-            return httpx.Response(200,json={'choices':[{'finish_reason':finish_reason,'message':{'content':'```json\n'+json.dumps(output)+'\n```'}}]},request=httpx.Request('POST',url))
+            assert url.endswith(':generateContent')
+            assert kwargs['headers']=={'x-goog-api-key':'test'}
+            assert 'properties' in kwargs['json']['generationConfig']['responseJsonSchema']
+            assert kwargs['json']['generationConfig']['maxOutputTokens']==6000
+            return httpx.Response(200,json={'candidates':[{'finishReason':'STOP' if valid else 'MAX_TOKENS','content':{'parts':[{'text':'```json\n'+json.dumps(output)+'\n```'}]}}]},request=httpx.Request('POST',url))
     monkeypatch.setattr(module.httpx,'AsyncClient',Provider)
     if valid:
         result=asyncio.run(module.generate(text))

@@ -1,6 +1,7 @@
 """StudyPilot multi-user API. Run from project root: uvicorn backend.main:app."""
 import json
 import logging
+from urllib.parse import urlsplit, quote as urlquote
 import os
 import re
 import secrets
@@ -152,36 +153,24 @@ async def generate(text, retest=False, previous=None, topics=None):
               'Each question must include an exact source_quote from these notes supporting the correct answer. '
               'Use topic headings from the notes. Explain the answer. No external facts. '
               + (f'Retest: use genuinely different questions from {json.dumps(previous or [])}. Focus on topics {json.dumps(topics or [])}. ' if retest else ''))
-            response_format = {'type':'json_object'}
-            if 'generativelanguage.googleapis.com' in AI_URL:
-                response_format = {'type':'json_schema','json_schema':{'name':'study_kit','schema':schema}}
+            native_gemini=urlsplit(AI_URL).hostname=='generativelanguage.googleapis.com'
             try:
-                response = await client.post(AI_URL+'/chat/completions', headers={'Authorization':'Bearer '+AI_KEY}, json={'model':AI_MODEL, 'messages':[{'role':'system','content':instructions+' Schema: '+json.dumps(schema)},{'role':'user','content':chunk}], 'response_format':response_format,'temperature':0.3,'max_tokens':6000})
+                if native_gemini:
+                    model_name=AI_MODEL.removeprefix('models/')
+                    response=await client.post('https://generativelanguage.googleapis.com/v1beta/models/'+urlquote(model_name,safe='')+':generateContent',
+                      headers={'x-goog-api-key':AI_KEY},json={
+                        'systemInstruction':{'parts':[{'text':instructions}]},
+                        'contents':[{'role':'user','parts':[{'text':chunk}]}],
+                        'generationConfig':{'responseMimeType':'application/json','responseJsonSchema':schema,'temperature':0.3,'maxOutputTokens':6000}})
+                else:
+                    response = await client.post(AI_URL+'/chat/completions', headers={'Authorization':'Bearer '+AI_KEY}, json={'model':AI_MODEL, 'messages':[{'role':'system','content':instructions+' Schema: '+json.dumps(schema)},{'role':'user','content':chunk}], 'response_format':{'type':'json_object'},'temperature':0.3,'max_tokens':6000})
                 response.raise_for_status()
             except httpx.HTTPStatusError as exc:
                 status=exc.response.status_code
                 reason=provider_diagnostic(exc.response)
-                from urllib.parse import urlsplit
                 provider=urlsplit(AI_URL).hostname or 'unset'
                 model=AI_MODEL if re.fullmatch(r'[a-zA-Z0-9._/-]{1,120}',AI_MODEL) else 'invalid-format'
                 logging.getLogger('studypilot.ai').warning('AI provider HTTP status=%s reason=%s host=%s model=%s',status,reason,provider,model)
-                if status==403 and provider=='generativelanguage.googleapis.com':
-                    try:
-                        probe=await client.get('https://generativelanguage.googleapis.com/v1beta/models',headers={'x-goog-api-key':AI_KEY})
-                        data=probe.json()
-                        if probe.status_code==200:
-                            available=any(m.get('name')=='models/'+AI_MODEL for m in data.get('models',[]))
-                            logging.getLogger('studypilot.ai').warning('Gemini native probe status=200 configured_model_listed=%s',available)
-                        else:
-                            error=data.get('error',{}) if isinstance(data,dict) else {}
-                            message=str(error.get('message','')) if isinstance(error,dict) else ''
-                            # This metadata-only request contains no source notes. Redact key/opaque tokens.
-                            message=message.replace(AI_KEY,'[redacted]') if AI_KEY else message
-                            message=re.sub(r'[A-Za-z0-9_./+=-]{30,}','[redacted]',message)
-                            message=' '.join(message.split())[:500]
-                            logging.getLogger('studypilot.ai').warning('Gemini native probe status=%s message=%s',probe.status_code,message)
-                    except (httpx.HTTPError,ValueError,TypeError,AttributeError):
-                        logging.getLogger('studypilot.ai').warning('Gemini native metadata probe unavailable')
                 messages={
                     400:'The AI provider rejected the request. Check AI_MODEL, AI_BASE_URL and whether the API key belongs to this provider in Render.',
                     401:'The AI provider rejected the API key. Update AI_API_KEY in Render and redeploy.',
@@ -206,12 +195,24 @@ async def generate(text, retest=False, previous=None, topics=None):
             except httpx.RequestError:
                 raise HTTPException(502,'Unable to connect to the AI provider. Check AI_BASE_URL in Render or retry later.') from None
             try:
-                choice=response.json()['choices'][0]
-                if choice.get('finish_reason')=='length':
-                    raise HTTPException(502,'The AI response was cut short by its output limit. Try a smaller section of notes.')
-                if choice.get('finish_reason') in {'content_filter','safety'} or choice.get('message',{}).get('refusal'):
-                    raise HTTPException(422,'The AI provider declined to process these notes. Try another section.')
-                content=choice['message']['content']
+                data=response.json()
+                if native_gemini:
+                    if data.get('promptFeedback',{}).get('blockReason'):
+                        raise HTTPException(422,'The AI provider declined to process these notes. Try another section.')
+                    candidate=data['candidates'][0]
+                    finish=candidate.get('finishReason')
+                    if finish=='MAX_TOKENS':
+                        raise HTTPException(502,'The AI response was cut short by its output limit. Try a smaller section of notes.')
+                    if finish not in {None,'STOP'}:
+                        raise HTTPException(422,'The AI provider could not complete this study kit. Try another section.')
+                    content=''.join(part.get('text','') for part in candidate.get('content',{}).get('parts',[]) if not part.get('thought'))
+                else:
+                    choice=data['choices'][0]
+                    if choice.get('finish_reason')=='length':
+                        raise HTTPException(502,'The AI response was cut short by its output limit. Try a smaller section of notes.')
+                    if choice.get('finish_reason') in {'content_filter','safety'} or choice.get('message',{}).get('refusal'):
+                        raise HTTPException(422,'The AI provider declined to process these notes. Try another section.')
+                    content=choice['message']['content']
                 if not isinstance(content,str) or not content.strip():
                     raise ValueError('empty_response')
                 content=content.strip()
