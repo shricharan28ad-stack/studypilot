@@ -86,7 +86,7 @@ The example env files are references, not automatically loaded by the Python ser
 | AI_GLOBAL_DAILY_LIMIT | Site-wide generation requests per 24-hour window | 100 |
 | VITE_API_URL | Browser API origin, same-origin, or blank demo mode | Blank |
 
-A generation request can make up to three model calls for long notes. Each call requests at most 6,000 output tokens. Uploads allow 10 MB and 300,000 characters; AI generation accepts at most 42,000 characters per kit. The request limit is not a dollar budget. Provider-side budget controls remain separate. Failed provider requests consume a request slot to avoid repeated uncontrolled retries.
+A generation request can make up to three model calls for long notes. Each call requests at most 6,000 output tokens. Uploads allow 10 MB and 300,000 characters. The browser extracts and previews uploaded text before generation, splitting long documents into selectable sections of at most 42,000 characters. Generate one kit per section; re-upload the document to choose another section after completing a kit. The selected section is sent to the API only when Create study kit is clicked. Pasted notes show a character count and can also be split into sections. The request limit is not a dollar budget. Provider-side budget controls remain separate. Failed provider requests consume a request slot to avoid repeated uncontrolled retries.
 
 ## Data and migration
 

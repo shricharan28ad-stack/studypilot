@@ -23,3 +23,16 @@ export async function extractFile(file:File){if(file.size>10*1024*1024)throw Err
 const configuredApi=(import.meta as unknown as {env:Record<string,string>}).env.VITE_API_URL||'';
 export const apiBase=configuredApi==='same-origin'?window.location.origin:configuredApi.replace(/\/$/,'');
 export async function api(path:string,body?:unknown){const res=await fetch(apiBase+path,{method:body?'POST':'GET',credentials:'include',headers:{...(body instanceof FormData?{}:{'Content-Type':'application/json'})},body:body?(body instanceof FormData?body:JSON.stringify(body)):undefined});if(res.status===401&&!path.includes('/auth/'))window.dispatchEvent(new Event('session-expired'));if(!res.ok){const error=await res.json().catch(()=>({detail:'Server unavailable'}));throw Error(typeof error.detail==='string'?error.detail:'The request was invalid. Please check your input.');}return res.json();}
+
+export function splitStudyNotes(text:string,limit=42000):string[]{
+ if(text.length>300000)throw Error('Please split documents larger than 300,000 characters.');
+ const sections:string[]=[];let remaining=text;
+ while(remaining.length>limit){
+  const target=Math.ceil(remaining.length/Math.ceil(remaining.length/limit));
+  const boundary=remaining.lastIndexOf('\n',target);
+  const cut=boundary>target*.75?boundary+1:target;
+  sections.push(remaining.slice(0,cut));remaining=remaining.slice(cut);
+ }
+ if(remaining)sections.push(remaining);
+ return sections;
+}
