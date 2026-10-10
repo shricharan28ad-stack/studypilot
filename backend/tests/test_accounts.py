@@ -34,7 +34,9 @@ def test_ai_required_and_limits(api,monkeypatch):
     monkeypatch.setenv('REQUIRE_AI','false')
     monkeypatch.setenv('AI_USER_DAILY_LIMIT','1')
     assert api.post('/api/study-kit/generate',json={'document_id':document['id']}).status_code==200
-    assert api.post('/api/study-kit/generate',json={'document_id':document['id']}).status_code==429
+    assert api.post('/api/study-kit/generate',json={'document_id':document['id']}).status_code==200
+    another=api.post('/api/documents/text',json={'name':'More notes','text':NOTES+' Extra source sentence.'}).json()
+    assert api.post('/api/study-kit/generate',json={'document_id':another['id']}).status_code==429
 
 def test_wrong_password_csrf_and_preferences(api):
     assert api.post('/api/auth/login',json={'email':'student@example.com','password':'wrong-password-123'}).status_code==401

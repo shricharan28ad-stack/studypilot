@@ -22,7 +22,25 @@ export function topicStats(attempts:Attempt[]){const map:Record<string,{n:number
 export async function extractFile(file:File){if(file.size>10*1024*1024)throw Error('Your file is over 10 MB. Please upload a smaller document.');const ext=file.name.split('.').pop()?.toLowerCase();if(ext==='txt')return file.text();if(ext==='docx'){const mammoth=await import('mammoth');return (await mammoth.extractRawText({arrayBuffer:await file.arrayBuffer()})).value;}if(ext==='pdf'){const pdf=await import('pdfjs-dist');pdf.GlobalWorkerOptions.workerSrc=new URL('pdfjs-dist/build/pdf.worker.min.mjs',import.meta.url).href;const doc=await pdf.getDocument({data:await file.arrayBuffer()}).promise;if(doc.numPages>150)throw Error('Please split PDFs longer than 150 pages.');let text='';for(let n=1;n<=doc.numPages;n++){const content=await(await doc.getPage(n)).getTextContent();text+=content.items.map(x=>'str'in x?x.str+('hasEOL'in x&&x.hasEOL?'\n':' '):'').join('')+'\n';}if(text.trim().length<80)throw Error('This PDF has no readable text. Scanned notes need OCR before uploading.');return text;}throw Error('Choose a PDF, DOCX or TXT file.');}
 const configuredApi=(import.meta as unknown as {env:Record<string,string>}).env.VITE_API_URL||'';
 export const apiBase=configuredApi==='same-origin'?window.location.origin:configuredApi.replace(/\/$/,'');
-export async function api(path:string,body?:unknown){const res=await fetch(apiBase+path,{method:body?'POST':'GET',credentials:'include',headers:{...(body instanceof FormData?{}:{'Content-Type':'application/json'})},body:body?(body instanceof FormData?body:JSON.stringify(body)):undefined});if(res.status===401&&!path.includes('/auth/'))window.dispatchEvent(new Event('session-expired'));if(!res.ok){const error=await res.json().catch(()=>({detail:'Server unavailable'}));throw Error(typeof error.detail==='string'?error.detail:'The request was invalid. Please check your input.');}return res.json();}
+export async function api(path:string,body?:unknown){
+ const controller=new AbortController();
+ const timer=setTimeout(()=>controller.abort(),path.includes('/generate')||path.includes('/retest')?260000:45000);
+ try{
+  const res=await fetch(apiBase+path,{method:body?'POST':'GET',credentials:'include',signal:controller.signal,headers:{...(body instanceof FormData?{}:{'Content-Type':'application/json'})},body:body?(body instanceof FormData?body:JSON.stringify(body)):undefined});
+  if(res.status===401&&!path.includes('/auth/'))window.dispatchEvent(new Event('session-expired'));
+  const data=await res.json().catch(()=>null);
+  if(!res.ok){
+   const fallback=res.status===429?'Too many requests. Wait before trying again.':res.status>=500?'The server is temporarily unavailable or restarting. Your notes remain here; try again shortly.':'The request was invalid. Please check your input.';
+   throw Error(typeof data?.detail==='string'?data.detail:fallback);
+  }
+  if(data===null)throw Error('The server returned an unreadable response. Please refresh and check your study materials.');
+  return data;
+ }catch(e){
+  if(e instanceof Error&&e.name==='AbortError')throw Error('The request timed out. Check Study materials before retrying; generation may have completed.');
+  if(e instanceof TypeError)throw Error('Unable to reach the server. Check your internet connection and try again. Your notes remain here.');
+  throw e;
+ }finally{clearTimeout(timer)}
+}
 
 export function splitStudyNotes(text:string,limit=42000):string[]{
  if(text.length>300000)throw Error('Please split documents larger than 300,000 characters.');

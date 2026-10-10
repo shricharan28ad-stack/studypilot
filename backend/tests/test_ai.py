@@ -75,7 +75,7 @@ def test_gemini_schema_and_pdf_line_breaks(monkeypatch,finish_reason,valid):
         assert result[2]=='AI generated'
         assert len(result[1])==len(output['questions'])
     else:
-        with pytest.raises(HTTPException,match='cut short'):asyncio.run(module.generate(text))
+        with pytest.raises(HTTPException,match='after one automatic retry'):asyncio.run(module.generate(text))
 
 @pytest.mark.parametrize('error,expected',[
  ({'message':'Your API key was reported as leaked. secret'},'KEY_REPORTED_LEAKED'),
@@ -133,3 +133,83 @@ def test_evidence_retry_recovers_without_saving_unverified_output(api,monkeypatc
     assert response.status_code==200
     assert len(calls)==2
     assert all(q['source_quote'] in NOTES for q in response.json()['questions'])
+
+@pytest.mark.parametrize('failure',['json','missing_field','empty','wrong_shape','truncated','timeout','connection','server'])
+def test_bounded_recovery(api,monkeypatch,failure):
+    import asyncio
+    import backend.main as module
+    monkeypatch.setattr(module,'AI_KEY','test')
+    monkeypatch.setattr(module,'AI_URL','https://example.com/v1')
+    facts=module.extract_facts(NOTES)
+    valid={'facts':facts,'questions':module.demo_questions(facts)}
+    calls=[]
+    class Provider:
+        def __init__(self,**kwargs):pass
+        async def __aenter__(self):return self
+        async def __aexit__(self,*args):pass
+        async def post(self,url,**kwargs):
+            calls.append(1)
+            req=httpx.Request('POST',url)
+            if len(calls)==1:
+                if failure=='timeout':raise httpx.ReadTimeout('timeout',request=req)
+                if failure=='connection':raise httpx.ConnectError('connection',request=req)
+                if failure=='server':return httpx.Response(503,json={},request=req)
+                if failure=='wrong_shape':return httpx.Response(200,json={'choices':None},request=req)
+                payload={'json':'{broken','empty':'','missing_field':'{"facts":[],"questions":[]}','truncated':json.dumps(valid)}[failure]
+                return httpx.Response(200,json={'choices':[{'finish_reason':'length' if failure=='truncated' else 'stop','message':{'content':payload}}]},request=req)
+            return httpx.Response(200,json={'choices':[{'message':{'content':json.dumps(valid)}}]},request=req)
+    monkeypatch.setattr(module.httpx,'AsyncClient',Provider)
+    assert asyncio.run(module.generate(NOTES))[2]=='AI generated'
+    assert len(calls)==2
+
+def test_format_failure_is_bounded_and_safe(api,monkeypatch,caplog):
+    import asyncio
+    import backend.main as module
+    from fastapi import HTTPException
+    monkeypatch.setattr(module,'AI_KEY','test')
+    monkeypatch.setattr(module,'AI_URL','https://example.com/v1')
+    calls=[]
+    class Provider:
+        def __init__(self,**kwargs):pass
+        async def __aenter__(self):return self
+        async def __aexit__(self,*args):pass
+        async def post(self,url,**kwargs):
+            calls.append(1)
+            return httpx.Response(200,json={'choices':[{'message':{'content':'private-invalid-output'}}]},request=httpx.Request('POST',url))
+    monkeypatch.setattr(module.httpx,'AsyncClient',Provider)
+    with pytest.raises(HTTPException,match='after one automatic retry'):
+        asyncio.run(module.generate(NOTES))
+    assert len(calls)==2
+    assert 'private-invalid-output' not in caplog.text
+
+def test_question_metadata_normalization(api):
+    import backend.main as module
+    q=module.demo_questions(module.extract_facts(NOTES))[0]
+    q.pop('id');q['difficulty']=' foundational ';q['level']='recall'
+    parsed=module.Question.model_validate(q)
+    assert parsed.id and parsed.difficulty=='Foundational' and parsed.level=='Recall'
+    q['options']=['Same',' same ']
+    with pytest.raises(ValueError):module.Question.model_validate(q)
+    assert module.normalize_evidence('ofﬁce  text')==module.normalize_evidence('office text')
+    assert module.normalize_evidence('not true')!=module.normalize_evidence('true')
+
+def test_repeated_upload_and_generation_reuse_existing_kit(api,monkeypatch):
+    import backend.main as module
+    doc=api.post('/api/documents/text',json={'name':'Notes','text':NOTES}).json()
+    again=api.post('/api/documents/text',json={'name':'Notes','text':NOTES}).json()
+    assert doc['id']==again['id']
+    kit=api.post('/api/study-kit/generate',json={'document_id':doc['id']}).json()
+    async def fail(*args):raise AssertionError('must not regenerate')
+    monkeypatch.setattr(module,'generate',fail)
+    repeated=api.post('/api/study-kit/generate',json={'document_id':doc['id']}).json()
+    assert repeated['id']==kit['id']
+    assert len(api.get('/api/state').json()['kits'])==1
+
+def test_concurrent_generation_guard_releases(api):
+    from fastapi import HTTPException
+    import backend.main as module
+    user={'id':'test-guard'}
+    with module.generation_slot(user):
+        with pytest.raises(HTTPException,match='already being generated'):
+            with module.generation_slot(user):pass
+    with module.generation_slot(user):pass
